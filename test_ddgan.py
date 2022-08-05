@@ -9,6 +9,7 @@ import torch
 import numpy as np
 
 import os
+print(os.environ.get("CUDA_PATH"), os.environ.get("CUDA_HOME"))
 
 import torchvision
 from score_sde.models.ncsnpp_generator_adagn import NCSNpp
@@ -182,7 +183,7 @@ def sample_and_test(args):
                 fake_sample = to_range_0_1(fake_sample)
                 for j, x in enumerate(fake_sample):
                     index = i * args.batch_size + j 
-                    torchvision.utils.save_image(x, './generated_samples/{}/{}.jpg'.format(args.dataset, index))
+                    torchvision.utils.save_image(x, f"{save_dir}/{index}.jpeg")
                 print('generating batch ', i)
         
         paths = [save_dir, real_img_dir]
@@ -194,7 +195,7 @@ def sample_and_test(args):
         x_t_1 = torch.randn(args.batch_size, args.num_channels,args.image_size, args.image_size).to(device)
         fake_sample = sample_from_model(pos_coeff, netG, args.num_timesteps, x_t_1,T,  args)
         fake_sample = to_range_0_1(fake_sample)
-        torchvision.utils.save_image(fake_sample, './samples_{}.jpg'.format(args.dataset))
+        torchvision.utils.save_image(fake_sample, f"{save_dir}/images_{args.batch_size}.jpeg")
 
     
     
