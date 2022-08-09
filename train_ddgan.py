@@ -28,6 +28,9 @@ from torch.multiprocessing import Process
 import torch.distributed as dist
 import shutil
 
+from util import ticktock
+
+
 def copy_source(file, output_dir):
     shutil.copyfile(file, os.path.join(output_dir, os.path.basename(file)))
             
@@ -35,6 +38,8 @@ def broadcast_params(params):
     for param in params:
         dist.broadcast(param.data, src=0)
 
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 #%% Diffusion coefficients 
 def var_func_vp(t, beta_min, beta_max):
@@ -187,10 +192,12 @@ def sample_from_model(coefficients, generator, n_time, x_init, T, opt):
     return x
 
 #%%
-def train(rank, gpu, args):
+def train(rank, gpu, args, trainlocal=False):
     from score_sde.models.discriminator import Discriminator_small, Discriminator_large
     from score_sde.models.ncsnpp_generator_adagn import NCSNpp
     from EMA import EMA
+
+    tt = ticktock("script")
     
     torch.manual_seed(args.seed + rank)
     torch.cuda.manual_seed(args.seed + rank)
@@ -238,19 +245,29 @@ def train(rank, gpu, args):
         dataset = LMDBDataset(root='/datasets/celeba-lmdb/', name='celeba', train=True, transform=train_transform)
       
     
-    
-    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset,
-                                                                    num_replicas=args.world_size,
-                                                                    rank=rank)
-    data_loader = torch.utils.data.DataLoader(dataset,
-                                               batch_size=batch_size,
-                                               shuffle=False,
-                                               num_workers=4,
-                                               pin_memory=True,
-                                               sampler=train_sampler,
-                                               drop_last = True)
+
+    if not trainlocal:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset,
+                                                                        num_replicas=args.world_size,
+                                                                        rank=rank)
+        data_loader = torch.utils.data.DataLoader(dataset,
+                                                   batch_size=batch_size,
+                                                   shuffle=False,
+                                                   num_workers=4,
+                                                   pin_memory=True,
+                                                   sampler=train_sampler,
+                                                   drop_last = True)
+
+    else:
+        data_loader = torch.utils.data.DataLoader(dataset,
+                                                  batch_size=batch_size,
+                                                  shuffle=False,
+                                                  num_workers=4,
+                                                  pin_memory=True,
+                                                  drop_last=True)
     
     netG = NCSNpp(args).to(device)
+    tt.msg(f"#param generator: {count_parameters(netG)}")
     
 
     if args.dataset == 'cifar10' or args.dataset == 'stackmnist':    
@@ -261,9 +278,12 @@ def train(rank, gpu, args):
         netD = Discriminator_large(nc = 2*args.num_channels, ngf = args.ngf, 
                                    t_emb_dim = args.t_emb_dim,
                                    act=nn.LeakyReLU(0.2)).to(device)
-    
-    broadcast_params(netG.parameters())
-    broadcast_params(netD.parameters())
+
+    tt.msg(f"#param discriminator: {count_parameters(netD)}")
+
+    if not trainlocal:
+        broadcast_params(netG.parameters())
+        broadcast_params(netD.parameters())
     
     optimizerD = optim.Adam(netD.parameters(), lr=args.lr_d, betas = (args.beta1, args.beta2))
     
@@ -274,12 +294,11 @@ def train(rank, gpu, args):
     
     schedulerG = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerG, args.num_epoch, eta_min=1e-5)
     schedulerD = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerD, args.num_epoch, eta_min=1e-5)
-    
-    
-    
+
     #ddp
-    netG = nn.parallel.DistributedDataParallel(netG, device_ids=[gpu])
-    netD = nn.parallel.DistributedDataParallel(netD, device_ids=[gpu])
+    if not trainlocal:
+        netG = nn.parallel.DistributedDataParallel(netG, device_ids=[gpu])
+        netD = nn.parallel.DistributedDataParallel(netD, device_ids=[gpu])
 
     
     exp = args.exp
@@ -298,6 +317,7 @@ def train(rank, gpu, args):
     T = get_time_schedule(args, device)
     
     if args.resume:
+        tt.msg("resuming")
         checkpoint_file = os.path.join(exp_path, 'content.pth')
         checkpoint = torch.load(checkpoint_file, map_location=device)
         init_epoch = checkpoint['epoch']
@@ -316,116 +336,93 @@ def train(rank, gpu, args):
                   .format(checkpoint['epoch']))
     else:
         global_step, epoch, init_epoch = 0, 0, 0
-    
-    
+
     for epoch in range(init_epoch, args.num_epoch+1):
-        train_sampler.set_epoch(epoch)
-       
+        if not trainlocal:
+            train_sampler.set_epoch(epoch)
+
+        # tt.msg(f"doing iterations: {len(data_loader)} batches, {subiters_discriminator} iters D / 1 iter G")
+        tt.msg(f"doing iterations: {len(data_loader)} batches")
+        tt.tick()
+        glosses = []
+        dlosses = []
         for iteration, (x, y) in enumerate(data_loader):
             for p in netD.parameters():  
                 p.requires_grad = True  
-        
-            
+
+            # for subiter in range(subiters_discriminator):
             netD.zero_grad()
-            
             #sample from p(x_0)
             real_data = x.to(device, non_blocking=True)
-            
             #sample t
             t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
-            
+
             x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
             x_t.requires_grad = True
-            
-    
+
             # train with real
             D_real = netD(x_t, t, x_tp1.detach()).view(-1)
-            
             errD_real = F.softplus(-D_real)
             errD_real = errD_real.mean()
-            
             errD_real.backward(retain_graph=True)
-            
-            
+
             if args.lazy_reg is None:
-                grad_real = torch.autograd.grad(
-                            outputs=D_real.sum(), inputs=x_t, create_graph=True
-                            )[0]
-                grad_penalty = (
-                                grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2
-                                ).mean()
-                
-                
+                grad_real = torch.autograd.grad(outputs=D_real.sum(), inputs=x_t, create_graph=True)[0]
+                grad_penalty = (grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2).mean()
+
                 grad_penalty = args.r1_gamma / 2 * grad_penalty
                 grad_penalty.backward()
             else:
                 if global_step % args.lazy_reg == 0:
-                    grad_real = torch.autograd.grad(
-                            outputs=D_real.sum(), inputs=x_t, create_graph=True
-                            )[0]
-                    grad_penalty = (
-                                grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2
-                                ).mean()
-                
-                
+                    grad_real = torch.autograd.grad(outputs=D_real.sum(), inputs=x_t, create_graph=True)[0]
+                    grad_penalty = (grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2).mean()
+
                     grad_penalty = args.r1_gamma / 2 * grad_penalty
                     grad_penalty.backward()
 
             # train with fake
             latent_z = torch.randn(batch_size, nz, device=device)
-            
-         
+
             x_0_predict = netG(x_tp1.detach(), t, latent_z)
             x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
-            
+
             output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
-                
-            
             errD_fake = F.softplus(output)
             errD_fake = errD_fake.mean()
             errD_fake.backward()
-    
-            
+
             errD = errD_real + errD_fake
+            dlosses.append(errD.item())
             # Update D
             optimizerD.step()
-            
-        
+
             #update G
             for p in netD.parameters():
                 p.requires_grad = False
             netG.zero_grad()
-            
-            
+
             t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
-            
-            
             x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
-                
-            
             latent_z = torch.randn(batch_size, nz,device=device)
-            
-            
-                
-           
             x_0_predict = netG(x_tp1.detach(), t, latent_z)
             x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
-            
+
             output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
-               
-            
             errG = F.softplus(-output)
             errG = errG.mean()
-            
+
             errG.backward()
             optimizerG.step()
-                
-           
-            
+
+            glosses.append(errG.item())
+
             global_step += 1
             if iteration % 100 == 0:
                 if rank == 0:
-                    print('epoch {} iteration{}, G Loss: {}, D Loss: {}'.format(epoch,iteration, errG.item(), errD.item()))
+                    avgGloss = np.mean(glosses) if len(glosses) > 0 else 0
+                    avgDloss = np.mean(dlosses) if len(dlosses) > 0 else 0
+                    tt.tock(f'Ep. {epoch} iter: {iteration}, G Loss: {avgGloss:.5f}, D Loss: {avgDloss:.5f}')
+                    tt.tick()
         
         if not args.no_lr_decay:
             
@@ -442,7 +439,7 @@ def train(rank, gpu, args):
             
             if args.save_content:
                 if epoch % args.save_content_every == 0:
-                    print('Saving content.')
+                    print(f'Saving content in {exp_path}.')
                     content = {'epoch': epoch + 1, 'global_step': global_step, 'args': args,
                                'netG_dict': netG.state_dict(), 'optimizerG': optimizerG.state_dict(),
                                'schedulerG': schedulerG.state_dict(), 'netD_dict': netD.state_dict(),
@@ -457,7 +454,6 @@ def train(rank, gpu, args):
                 torch.save(netG.state_dict(), os.path.join(exp_path, 'netG_{}.pth'.format(epoch)))
                 if args.use_ema:
                     optimizerG.swap_parameters_with_ema(store_params_in_ema=True)
-            
 
 
 def init_processes(rank, size, fn, args):
@@ -566,8 +562,9 @@ if __name__ == '__main__':
     ###ddp
     parser.add_argument('--num_proc_node', type=int, default=1,
                         help='The number of nodes in multi node env.')
-    parser.add_argument('--num_process_per_node', type=int, default=1,
+    parser.add_argument('--num_gpus_per_node', type=int, default=1,
                         help='number of gpus')
+    parser.add_argument('--which_gpu', type=int, default=0, help='which gpu to use')
     parser.add_argument('--node_rank', type=int, default=0,
                         help='The index of node.')
     parser.add_argument('--local_rank', type=int, default=0,
@@ -577,15 +574,18 @@ if __name__ == '__main__':
 
    
     args = parser.parse_args()
-    args.world_size = args.num_proc_node * args.num_process_per_node
-    size = args.num_process_per_node
+    args.world_size = args.num_proc_node * args.num_gpus_per_node
+    size = args.num_gpus_per_node
+
+    if size == 1:
+        train(0, args.which_gpu, args, trainlocal=True)
 
     if size > 1:
         processes = []
         for rank in range(size):
             args.local_rank = rank
-            global_rank = rank + args.node_rank * args.num_process_per_node
-            global_size = args.num_proc_node * args.num_process_per_node
+            global_rank = rank + args.node_rank * args.num_gpus_per_node
+            global_size = args.num_proc_node * args.num_gpus_per_node
             args.global_rank = global_rank
             print('Node rank %d, local proc %d, global proc %d' % (args.node_rank, rank, global_rank))
             p = Process(target=init_processes, args=(global_rank, global_size, train, args))
