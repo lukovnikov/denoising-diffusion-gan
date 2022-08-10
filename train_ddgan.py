@@ -233,6 +233,9 @@ def train(rank, gpu, args, trainlocal=False):
         train_data = LSUN(root='/datasets/LSUN/', classes=['church_outdoor_train'], transform=train_transform)
         subset = list(range(0, 120000))
         dataset = torch.utils.data.Subset(train_data, subset)
+
+    elif args.dataset.startswith("afhq_cats"):
+        
       
     
     elif args.dataset == 'celeba_256':
