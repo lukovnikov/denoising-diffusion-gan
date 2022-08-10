@@ -235,7 +235,7 @@ def train(rank, gpu, args, trainlocal=False):
         dataset = torch.utils.data.Subset(train_data, subset)
 
     elif args.dataset.startswith("afhq_cats"):
-        
+        pass
       
     
     elif args.dataset == 'celeba_256':
@@ -473,6 +473,10 @@ def init_processes(rank, size, fn, args):
 def cleanup():
     dist.destroy_process_group()    
 #%%
+
+
+# CIFAR10:   python train_ddgan.py --dataset cifar10 --exp ddgan_cifar10_exp1 --batch_size 64 --num_epoch 1800 -n_mlp 4 --use_ema --r1_gamma 0.02 --lr_d 1.25e-4 --lr_g 1.6e-4 --lazy_reg 15 --ch_mult 1 2 2 2 --num_gpus_per_node 1 --which_gpu 0
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('ddgan parameters')
     parser.add_argument('--seed', type=int, default=1024,

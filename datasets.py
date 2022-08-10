@@ -41,7 +41,7 @@ class AFHQDataset(VisionDataset):
     def __init__(
         self,
         root: str,
-        subset:str="cats",
+        subset:str="cat",
         train: bool = True,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
@@ -54,6 +54,11 @@ class AFHQDataset(VisionDataset):
         self.split = "train" if self.train is True else "test"
         self.subset = subset
 
+        self.filenames = []
+        for name in os.listdir(os.path.join(self.root, self.split, self.subset)):
+            if os.path.isfile(os.path.join(self.root, self.split, self.subset, name)):
+                self.filenames.append(name)
+
         # if download:
         #     self.download()
         #
@@ -61,7 +66,7 @@ class AFHQDataset(VisionDataset):
         #     raise RuntimeError("Dataset not found or corrupted. You can use download=True to download it")
 
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
-        X = Image.open(os.path.join(self.root, self.split, self.subset, self.filename[index]))
+        X = Image.open(os.path.join(self.root, self.split, self.subset, self.filenames[index]))
 
         target: Any = []
         for t in self.target_type:
@@ -90,9 +95,8 @@ class AFHQDataset(VisionDataset):
 
         return X, target
 
-
     def __len__(self) -> int:
-        return len(self.data)
+        return len(self.filenames)
 
     # def _check_integrity(self) -> bool:
     #     root = self.root
@@ -115,6 +119,6 @@ class AFHQDataset(VisionDataset):
 
 
 if __name__ == '__main__':
-    ds = AFHQDataset("./datasets/afhq/", "cats", train=True)
+    ds = AFHQDataset("./datasets/afhq/", "cat", train=True)
     print(len(ds))
     print(ds[0].size())
