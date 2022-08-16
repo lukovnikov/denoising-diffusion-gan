@@ -19,6 +19,8 @@ import torchvision
 
 import torchvision.transforms as transforms
 from torchvision.datasets import CIFAR10
+
+from datasets import AFHQDataset
 from datasets_prep.lsun import LSUN
 from datasets_prep.stackmnist_data import StackedMNIST, _data_transforms_stacked_mnist
 from datasets_prep.lmdb_datasets import LMDBDataset
@@ -235,7 +237,11 @@ def train(rank, gpu, args, trainlocal=False):
         dataset = torch.utils.data.Subset(train_data, subset)
 
     elif args.dataset.startswith("afhq_cats"):
-        pass
+        dataset = AFHQDataset("./datasets/afhq/", "cat", transform=transforms.Compose([
+            transforms.Resize(args.image_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]))
       
     
     elif args.dataset == 'celeba_256':
@@ -273,7 +279,7 @@ def train(rank, gpu, args, trainlocal=False):
     tt.msg(f"#param generator: {count_parameters(netG)}")
     
 
-    if args.dataset == 'cifar10' or args.dataset == 'stackmnist':    
+    if args.dataset == 'cifar10' or args.dataset == 'stackmnist' or args.image_size < 128:
         netD = Discriminator_small(nc = 2*args.num_channels, ngf = args.ngf,
                                t_emb_dim = args.t_emb_dim,
                                act=nn.LeakyReLU(0.2)).to(device)

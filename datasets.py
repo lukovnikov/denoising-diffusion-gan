@@ -2,11 +2,13 @@ import os
 import pickle
 from typing import Optional, Callable, Any, Tuple
 
+import torch
 from PIL import Image
 from torchvision.datasets import VisionDataset
 from torchvision.datasets.utils import check_integrity, download_and_extract_archive
 
 import numpy as np
+from torchvision.transforms import transforms
 
 
 class AFHQDataset(VisionDataset):
@@ -68,30 +70,10 @@ class AFHQDataset(VisionDataset):
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         X = Image.open(os.path.join(self.root, self.split, self.subset, self.filenames[index]))
 
-        target: Any = []
-        for t in self.target_type:
-            if t == "attr":
-                target.append(self.attr[index, :])
-            elif t == "identity":
-                target.append(self.identity[index, 0])
-            elif t == "bbox":
-                target.append(self.bbox[index, :])
-            elif t == "landmarks":
-                target.append(self.landmarks_align[index, :])
-            else:
-                # TODO: refactor with utils.verify_str_arg
-                raise ValueError(f'Target type "{t}" is not recognized.')
+        target = torch.tensor([0])
 
         if self.transform is not None:
             X = self.transform(X)
-
-        if target:
-            target = tuple(target) if len(target) > 1 else target[0]
-
-            if self.target_transform is not None:
-                target = self.target_transform(target)
-        else:
-            target = None
 
         return X, target
 
@@ -119,6 +101,11 @@ class AFHQDataset(VisionDataset):
 
 
 if __name__ == '__main__':
-    ds = AFHQDataset("./datasets/afhq/", "cat", train=True)
+    ds = AFHQDataset("./datasets/afhq/", "cat", transform=transforms.Compose([
+                        transforms.Resize(32),
+                        transforms.RandomHorizontalFlip(),
+                        transforms.ToTensor(),
+                        transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))]))
     print(len(ds))
-    print(ds[0].size())
+    x = ds[5][0]
+    print(x.size())

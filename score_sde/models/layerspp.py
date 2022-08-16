@@ -99,7 +99,7 @@ class AttnBlockpp(nn.Module):
     super().__init__()
     self.GroupNorm_0 = nn.GroupNorm(num_groups=min(channels // 4, 32), num_channels=channels,
                                   eps=1e-6)
-    self.NIN_0 = NIN(channels, channels)
+    self.NIN_0 = NIN(channels, channels)    # this is just linear layer on channel dimension
     self.NIN_1 = NIN(channels, channels)
     self.NIN_2 = NIN(channels, channels)
     self.NIN_3 = NIN(channels, channels, init_scale=init_scale)

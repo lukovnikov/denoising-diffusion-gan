@@ -64,8 +64,8 @@ def variance_scaling_init_(tensor, scale):
     return kaiming_uniform_(tensor, gain=1e-10 if scale == 0 else scale, mode='fan_avg')
 
 
-def dense(in_channels, out_channels, init_scale=1.):
-    lin = nn.Linear(in_channels, out_channels)
+def dense(in_channels, out_channels, init_scale=1., bias=True):
+    lin = nn.Linear(in_channels, out_channels, bias=bias)
     variance_scaling_init_(lin.weight, scale=init_scale)
     nn.init.zeros_(lin.bias)
     return lin
