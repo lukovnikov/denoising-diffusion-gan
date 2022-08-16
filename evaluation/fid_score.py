@@ -86,8 +86,6 @@ IMAGE_EXTENSIONS = {'bmp', 'jpg', 'jpeg', 'pgm', 'png', 'ppm',
                     'tif', 'tiff', 'webp'}
 
 
-
-
 class ImagePathDataset(torch.utils.data.Dataset):
     def __init__(self, files, transforms=None):
         self.files = files
@@ -283,7 +281,6 @@ def calculate_fid_given_paths(paths, batch_size, device, dims, resize=0):
     del model
     fid_value = calculate_frechet_distance(m1, s1, m2, s2)
     return fid_value
-
 
 
 def main():

@@ -13,7 +13,7 @@ print(os.environ.get("CUDA_PATH"), os.environ.get("CUDA_HOME"))
 
 import torchvision
 from score_sde.models.ncsnpp_generator_adagn import NCSNpp
-from pytorch_fid.fid_score import calculate_fid_given_paths
+from evaluation.fid_score import calculate_fid_given_paths
 
 
 #%% Diffusion coefficients 
@@ -141,11 +141,11 @@ def sample_and_test(args):
     device = 'cuda:0'
     
     if args.dataset == 'cifar10':
-        real_img_dir = 'pytorch_fid/cifar10_train_stat.npy'
+        real_img_dir = 'evaluation/cifar10_train_stat.npy'
     elif args.dataset == 'celeba_256' or args.dataset == 'celeba':
-        real_img_dir = 'pytorch_fid/celeba_256_stat.npy'
+        real_img_dir = 'evaluation/celeba_256_stat.npy'
     elif args.dataset == 'lsun':
-        real_img_dir = 'pytorch_fid/lsun_church_stat.npy'
+        real_img_dir = 'evaluation/lsun_church_stat.npy'
     else:
         real_img_dir = args.real_img_dir
     
@@ -154,11 +154,11 @@ def sample_and_test(args):
     
     netG = NCSNpp(args).to(device)
     # ckpt = torch.load('./saved_info/dd_gan/{}/{}/netG_{}.pth'.format(args.dataset, args.exp, args.epoch_id), map_location=device)
-    ckpt = torch.load(f"./checkpoints/{args.ckpt}.pth")
+    ckpt = torch.load(f"./saved_info/dd_gan/{args.dataset}/{args.ckpt}")
 
     #loading weights from ddp in single gpu
-    for key in list(ckpt.keys()):
-        ckpt[key[7:]] = ckpt.pop(key)
+    # for key in list(ckpt.keys()):
+    #    ckpt[key[7:]] = ckpt.pop(key)
     netG.load_state_dict(ckpt)
     netG.eval()
     
@@ -259,7 +259,7 @@ if __name__ == '__main__':
     #geenrator and training
     # parser.add_argument('--exp', default='experiment_cifar_default', help='name of experiment')
     parser.add_argument('--ckpt', default='experiment_cifar_default', help='Which checkpoint to load')
-    parser.add_argument('--real_img_dir', default='./pytorch_fid/cifar10_train_stat.npy', help='directory to real images for FID computation')
+    parser.add_argument('--real_img_dir', default='./evaluation/cifar10_train_stat.npy', help='directory to real images for FID computation')
 
     parser.add_argument('--dataset', default='cifar10', help='name of dataset')
     parser.add_argument('--image_size', type=int, default=32,

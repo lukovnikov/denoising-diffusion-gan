@@ -7,6 +7,7 @@ from score_sde.models.dense_layer import dense
 from score_sde.models.discriminator import conv2d
 from score_sde.models.layerspp import AdaptiveGroupNorm
 from score_sde.models.ncsnpp_generator_adagn import PixelNorm
+from util import count_parameters
 
 
 class LinearOnChannel(torch.nn.Module):
@@ -59,7 +60,8 @@ class MHSelfAttn(torch.nn.Module):
         attn_weights = torch.softmax(attn_scores, dim=-1)
         attn_weights = attn_weights.view(batsize, self.numheads, height, width, height, width)
 
-        h = torch.einsum("bhxyij,bhdij->bhxy", attn_weights, v)
+        h = torch.einsum("bhxyij,bhdij->bhdxy", attn_weights, v)
+        h = h.reshape(batsize, self.dim, height, width)
         h = self.postmap(h)
 
         ret = x + h
@@ -77,7 +79,7 @@ class LearnedPositionalEmbeddings(torch.nn.Module):
 
     def forward(self, x):
         posemb = self.xemb.weight[:, None, :] + self.yemb.weight[None, :, :]
-        ret = posemb[None, :, :, :] + x
+        ret = posemb.permute(2, 0, 1)[None, :, :, :] + x
         return ret
 
 
@@ -158,7 +160,8 @@ class MHCrossAttn(torch.nn.Module):
         attn_weights = torch.softmax(attn_scores, dim=-1)
         attn_weights = attn_weights.view(batsize, self.numheads, height2, width2, height, width)
 
-        h = torch.einsum("bhxyij,bhdij->bhxy", attn_weights, v)
+        h = torch.einsum("bhxyij,bhdij->bhdxy", attn_weights, v)
+        h = h.reshape(batsize, self.dim, height2, width2)
         h = self.postmap(h)
 
         ret = skip_b + h
@@ -223,6 +226,14 @@ class TransformerLayerCrossAttn(torch.nn.Module):
 
 
 class SpecialTransformerLayer(torch.nn.Module):
+    """
+    Assumes input is image and a (smaller) "memory" image.
+    This layer has three phases:
+    1. pull information from real image into the memory image using multi-head attention
+    2. do multi-head self-attention over the memory image
+    3. perform an update using two FF layers
+    4. pull information from memory image into image using multi-head attention
+    """
     def __init__(self, dim=64, memdim=64, numheads=2, skip_rescale=True,
                  add_pos=False, imgsize=-1, memsize=-1, step_emb_dim=1,
                  z_emb_dim=-1,
@@ -231,21 +242,21 @@ class SpecialTransformerLayer(torch.nn.Module):
         self.dim, self.memdim, self.numheads, self.skip_rescale, self.step_emb_dim, self.z_emb_dim \
             = dim, memdim, numheads, skip_rescale, step_emb_dim, z_emb_dim
         self.dim_ff = self.dim * 2
-        self.dim_ff_cells = self.dim_cells * 2
+        self.dim_ff_cells = self.memdim * 2
 
-        self.groupnorm_x = torch.nn.GroupNorm(num_groups=min(dim // 4, 32), num_channels=dim, eps=1e-6)
-        self.linA_x = dense(self.dim, self.dim_ff)
-        self.linB_x = dense(self.dim_ff, self.dim)
+        self.groupnorm = torch.nn.GroupNorm(num_groups=min(dim // 4, 32), num_channels=dim, eps=1e-6)
+        self.linA = LinearOnChannel(self.dim, self.dim_ff)
+        self.linB = LinearOnChannel(self.dim_ff, self.dim)
 
         self.groupnorm_cells = torch.nn.GroupNorm(num_groups=min(memdim // 4, 32), num_channels=memdim, eps=1e-6)
-        self.linA_cells = dense(self.dim, self.dim_ff)
-        self.linB_cells = dense(self.dim_ff, self.dim_cells)
+        self.linA_cells = LinearOnChannel(self.memdim, self.dim_ff_cells)
+        self.linB_cells = LinearOnChannel(self.dim_ff_cells, self.memdim)
         self.act = act
 
         self.mhsa = MHSelfAttn(dim=self.memdim, numheads=self.numheads, skip_rescale=skip_rescale)
-        self.mhca = MHCrossAttn(dimA=self.dim, dimB=memdim, numheads=self.numheads, skip_rescale=skip_rescale,
+        self.mhca = MHCrossAttn(dimA=self.dim, dimB=self.memdim, numheads=self.numheads, skip_rescale=skip_rescale,
                                 add_pos=add_pos, Asize=imgsize, Bsize=memsize)
-        self.mhca2 = MHCrossAttn(dimA=self.dim_cells, dimB=dim, numheads=self.numheads, skip_rescale=skip_rescale,
+        self.mhca2 = MHCrossAttn(dimA=self.memdim, dimB=self.dim, numheads=self.numheads, skip_rescale=skip_rescale,
                                 add_pos=add_pos, Asize=memsize, Bsize=imgsize)
 
         self.step_linear = dense(self.step_emb_dim, self.memdim)
@@ -328,13 +339,13 @@ class ResidualBlock(torch.nn.Module):
         self.adaptive = self.z_emb_dim != -1
         if self.adaptive:
             self.groupnorm1 = AdaptiveGroupNorm(min(in_channels // 4, 32), in_channels, self.z_emb_dim)
-            self.groupnorm2 = AdaptiveGroupNorm(min(in_channels // 4, 32), in_channels, self.z_emb_dim)
+            self.groupnorm2 = AdaptiveGroupNorm(min(out_channels // 4, 32), out_channels, self.z_emb_dim)
         else:
             self.groupnorm1 = torch.nn.GroupNorm(num_groups=min(in_channels // 4, 32), num_channels=in_channels, eps=1e-6)
-            self.groupnorm2 = torch.nn.GroupNorm(num_groups=min(in_channels // 4, 32), num_channels=in_channels, eps=1e-6)
+            self.groupnorm2 = torch.nn.GroupNorm(num_groups=min(out_channels // 4, 32), num_channels=out_channels, eps=1e-6)
 
         self.skip = None
-        if self.in_channels != self.out_channels or self.up or self.down:
+        if self.in_channels != self.out_channels or self.upsample or self.downsample:
             self.skip = LinearOnChannel(in_channels, out_channels, bias=False)
 
     def forward(self, input, t_emb=None, z_emb=None):
@@ -373,7 +384,7 @@ class ResidualBlock(torch.nn.Module):
 
 
 class TimestepEmbedding(torch.nn.Module):
-    def __init__(self, outdim, act=torch.nn.GeLU(), maxsteps=-1):
+    def __init__(self, outdim, act=torch.nn.GELU(), maxsteps=-1):
         """
         :param hdim:
         :param outdim:
@@ -383,13 +394,13 @@ class TimestepEmbedding(torch.nn.Module):
         super().__init__()
         self.embdim, self.hdim, self.outdim, self.maxsteps \
             = 1000, outdim, outdim, maxsteps
-        self.net = torch.nn.Sequential([
+        self.net = torch.nn.Sequential(
             dense(1, self.embdim),
             act,
             dense(self.embdim, self.hdim),
             act,
             dense(self.hdim, self.outdim)
-        ])
+        )
 
     def forward(self, t, maxsteps=None):
         # "t" are discrete steps between 0 and self.maxsteps
@@ -401,7 +412,7 @@ class TimestepEmbedding(torch.nn.Module):
 
 
 class Discriminator_32x32(torch.nn.Module):
-    def __init__(self, num_inp_channels=3, imgsize=32, num_features=32, num_heads=2, step_emb_dim=128, act=torch.nn.LeakyReLU(0.2),
+    def __init__(self, num_inp_channels=3, imgsize=32, num_features=64, num_heads=2, step_emb_dim=128, act=torch.nn.LeakyReLU(0.2),
                  memsize=10, memdim=256, maxsteps=-1):
         super().__init__()
         self.num_inp_channels, self.imgsize, self.num_features, self.step_emb_dim, self.memsize, self.memdim, self.numheads, self.maxsteps \
@@ -436,7 +447,7 @@ class Discriminator_32x32(torch.nn.Module):
         inp = torch.cat((x, x_t), dim=1)  # (batsize, 6, height, width)
 
         # initialize memory
-        cells = torch.zeros(batsize, self.memdim, self.memsize, self.memsize)
+        cells = torch.zeros(batsize, self.memdim, self.memsize, self.memsize).to(x.device)
         cells = self.cell_posembed(cells)
 
         # run layers
@@ -473,10 +484,10 @@ class ZMapper(torch.nn.Module):
 
         self.layers = torch.nn.Sequential(
             PixelNorm(),
-            dense(self.nz, self.zembdim),
+            dense(self.zdim, self.zembdim),
             self.act
         )
-        for _ in range(numlayers):
+        for _ in range(numlayers-1):
             self.layers.append(dense(self.zembdim, self.zembdim))
             self.layers.append(self.act)
 
@@ -486,10 +497,10 @@ class ZMapper(torch.nn.Module):
 
 class Generator_32x32(torch.nn.Module):
     def __init__(self, num_inp_channels=3, imgsize=32, num_features=64, num_heads=2, step_emb_dim=128, zdim=128, z_emb_dim=128, act=torch.nn.LeakyReLU(0.2),
-                 memsize=10, memdim=256, maxsteps=-1):
+                 memsize=10, memdim=256, maxsteps=-1, num_z_map_layers=4):
         super().__init__()
-        self.num_inp_channels, self.imgsize, self.num_features, self.step_emb_dim, self.memsize, self.memdim, self.numheads, self.maxsteps, self.z_emb_dim, self.zdim \
-            = num_inp_channels, imgsize, num_features, step_emb_dim, memsize, memdim, num_heads, maxsteps, z_emb_dim, zdim
+        self.num_inp_channels, self.imgsize, self.num_features, self.step_emb_dim, self.memsize, self.memdim, self.numheads, self.maxsteps, self.z_emb_dim, self.zdim, self.num_z_map_layers \
+            = num_inp_channels, imgsize, num_features, step_emb_dim, memsize, memdim, num_heads, maxsteps, z_emb_dim, zdim, num_z_map_layers
 
         self.act = act
         self.time_embed = TimestepEmbedding(step_emb_dim, act=act, maxsteps=self.maxsteps)
@@ -567,3 +578,22 @@ class Generator_32x32(torch.nn.Module):
         out = self.outmap(h)
 
         return out
+
+
+if __name__ == '__main__':
+    m = Discriminator_32x32(maxsteps=32)
+    print(m)
+    print(count_parameters(m))
+
+    x = torch.rand(5, 3, 32, 32)
+    x_t = torch.rand(5, 3, 32, 32)
+    t = torch.randint(0, 32, (5,))
+
+    y = m(x, t, x_t)
+    print(y)
+
+    m = Generator_32x32(maxsteps=32)
+    print(m)
+    print(count_parameters(m))
+    y = m(x, t)
+    print(y)

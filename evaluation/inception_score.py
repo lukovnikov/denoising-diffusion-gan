@@ -22,8 +22,12 @@ Returns:
     Mean and standard deviation of the Inception Score across the splits.
 '''
 import argparse
+import pathlib
 
 import tensorflow.compat.v1 as tf
+from PIL import Image
+from tqdm import tqdm
+
 tf.disable_v2_behavior()
 import tensorflow_gan as tfgan
 import os
@@ -32,7 +36,7 @@ import numpy as np
 import time
 from tensorflow.python.ops import array_ops
 # pip install tensorflow-gan
-import tensorflow_gan as tfgan
+# import tensorflow_gan as tfgan
 session=tf.compat.v1.InteractiveSession()
 # A smaller BATCH_SIZE reduces GPU memory usage, but at the cost of a slight slowdown
 BATCH_SIZE = 64
@@ -62,7 +66,7 @@ def get_inception_probs(inps):
     session=tf.get_default_session()
     n_batches = int(np.ceil(float(inps.shape[0]) / BATCH_SIZE))
     preds = np.zeros([inps.shape[0], 1000], dtype = np.float32)
-    for i in range(n_batches):
+    for i in tqdm(range(n_batches)):
         inp = inps[i * BATCH_SIZE:(i + 1) * BATCH_SIZE] / 255. * 2 - 1
         preds[i * BATCH_SIZE : i * BATCH_SIZE + min(BATCH_SIZE, inp.shape[0])] = session.run(logits,{inception_images: inp})[:, :1000]
     preds = np.exp(preds) / np.sum(np.exp(preds), 1, keepdims=True)
@@ -90,14 +94,25 @@ def get_inception_score(images, splits=10):
     return mean, std  # Reference values: 11.38 for 50000 CIFAR-10 training set images, or mean=11.31, std=0.10 if in 10 splits.
 
 
+IMAGE_EXTENSIONS = {'bmp', 'jpg', 'jpeg', 'pgm', 'png', 'ppm',
+                    'tif', 'tiff', 'webp'}
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--sample_dir', default='./saved_samples/', help='path to saved images')
+    parser.add_argument('--sample_dir', default=None, help='path to saved images')
     opt = parser.parse_args()
 
-    data = np.load(opt.sample_dir)
-    data = np.clip(data, 0, 255)
-    m, s = get_inception_score(data, splits=1)
+    # TODO: load images from directory into numpy array (batsize, 3, H, W)
+    path = pathlib.Path(opt.sample_dir)
+    files = sorted([file for ext in IMAGE_EXTENSIONS
+                    for file in path.glob('*.{}'.format(ext))])
+    print(f"Loading {len(files)} image files into numpy array")
+    data = [np.array(Image.open(file).convert("RGB")) for file in tqdm(files)]
+    data = np.stack(data, 0)
+    data = data.transpose((0, 3, 1, 2))
+
+    m, s = get_inception_score(data, splits=10)
     
     print('mean: ', m)
     print('std: ', s)

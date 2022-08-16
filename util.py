@@ -254,3 +254,6 @@ def argprun(f, sigint_shell=True, **kwargs):   # command line overrides kwargs
         except Exception as e:
             pass
 # endregion
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)

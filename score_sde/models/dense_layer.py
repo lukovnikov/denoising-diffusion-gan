@@ -67,7 +67,8 @@ def variance_scaling_init_(tensor, scale):
 def dense(in_channels, out_channels, init_scale=1., bias=True):
     lin = nn.Linear(in_channels, out_channels, bias=bias)
     variance_scaling_init_(lin.weight, scale=init_scale)
-    nn.init.zeros_(lin.bias)
+    if bias:
+        nn.init.zeros_(lin.bias)
     return lin
 
 def conv2d(in_planes, out_planes, kernel_size=(3, 3), stride=1, dilation=1, padding=1, bias=True, padding_mode='zeros',
