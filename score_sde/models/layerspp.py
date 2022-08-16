@@ -44,7 +44,7 @@ default_init = layers.default_init
 dense = dense_layer.dense
 
 class AdaptiveGroupNorm(nn.Module):
-    def __init__(self, num_groups,in_channel, style_dim):
+    def __init__(self, num_groups, in_channel, style_dim):
         super().__init__()
 
         self.norm = nn.GroupNorm(num_groups, in_channel, affine=False, eps=1e-6)

@@ -39,7 +39,7 @@ class MHSelfAttn(torch.nn.Module):
 
         self.add_pos = add_pos
         if self.add_pos:
-            self.posemb = LearnedPositionalEmbeddings(height, width, self.dim)
+            self.posemb = LearnedPositionalEmbeddings2D(height, width, self.dim)
 
     def forward(self, x):
         batsize, numchannels, height, width = x.shape
@@ -70,16 +70,29 @@ class MHSelfAttn(torch.nn.Module):
         return ret
 
 
-class LearnedPositionalEmbeddings(torch.nn.Module):
+class LearnedPositionalEmbeddings2D(torch.nn.Module):
     def __init__(self, height, width, dim):
         super().__init__()
-        self.height, self.width = height, width
+        self.height, self.width, self.dim = height, width, dim
         self.xemb = torch.nn.Embedding(self.height, dim)
         self.yemb = torch.nn.Embedding(self.width, dim)
 
     def forward(self, x):
         posemb = self.xemb.weight[:, None, :] + self.yemb.weight[None, :, :]
         ret = posemb.permute(2, 0, 1)[None, :, :, :] + x
+        return ret
+
+
+class LearnedPositionalEmbeddings2DIndep(torch.nn.Module):
+    def __init__(self, height, width, dim):
+        super().__init__()
+        self.height, self.width, self.dim = height, width, dim
+        self.size = height * width
+        self.emb = torch.nn.Embedding(self.size, dim)
+
+    def forward(self, x):
+        posemb = self.emb.weight.view(self.height, self.width, self.dim).permute(2, 0, 1)
+        ret = posemb[None, :, :, :] + x
         return ret
 
 
@@ -132,8 +145,9 @@ class MHCrossAttn(torch.nn.Module):
 
         self.add_pos = add_pos
         if self.add_pos:
-            self.posA = LearnedPositionalEmbeddings(Asize, Asize, self.dimA)
-            self.posB = LearnedPositionalEmbeddings(Bsize, Bsize, self.dimB)
+            assert False, "don't use this code"
+            self.posA = LearnedPositionalEmbeddings2D(Asize, Asize, self.dimA)
+            self.posB = LearnedPositionalEmbeddings2D(Bsize, Bsize, self.dimB)
 
     def forward(self, a, b):
         batsize, numchannels, height, width = a.shape
@@ -235,20 +249,28 @@ class SpecialTransformerLayer(torch.nn.Module):
     4. pull information from memory image into image using multi-head attention
     """
     def __init__(self, dim=64, memdim=64, numheads=2, skip_rescale=True,
-                 add_pos=False, imgsize=-1, memsize=-1, step_emb_dim=1,
-                 z_emb_dim=-1,
+                 add_pos=False, imgsize=-1, memsize=-1, step_emb_dim=-1,
+                 z_emb_dim=-1, adaptdim=-1,
                  act=torch.nn.GELU()):
         super().__init__()
-        self.dim, self.memdim, self.numheads, self.skip_rescale, self.step_emb_dim, self.z_emb_dim \
-            = dim, memdim, numheads, skip_rescale, step_emb_dim, z_emb_dim
+        self.dim, self.memdim, self.numheads, self.skip_rescale, self.step_emb_dim, self.z_emb_dim, self.adaptdim \
+            = dim, memdim, numheads, skip_rescale, step_emb_dim, z_emb_dim, adaptdim
         self.dim_ff = self.dim * 2
         self.dim_ff_cells = self.memdim * 2
 
-        self.groupnorm = torch.nn.GroupNorm(num_groups=min(dim // 4, 32), num_channels=dim, eps=1e-6)
+        adaptive = self.step_emb_dim != -1 or self.z_emb_dim != -1
+
+        if adaptive:
+            self.adaptdim = self.dim if self.adaptdim == -1 else self.adaptdim
+            self.groupnorm = AdaptiveGroupNorm(min(dim // 4, 32), dim, self.adaptdim)
+            self.groupnorm_cells = AdaptiveGroupNorm(min(memdim // 4, 32), memdim, self.adaptdim)
+        else:
+            self.groupnorm = torch.nn.GroupNorm(num_groups=min(dim // 4, 32), num_channels=dim, eps=1e-6)
+            self.groupnorm_cells = torch.nn.GroupNorm(num_groups=min(memdim // 4, 32), num_channels=memdim, eps=1e-6)
+
         self.linA = LinearOnChannel(self.dim, self.dim_ff)
         self.linB = LinearOnChannel(self.dim_ff, self.dim)
 
-        self.groupnorm_cells = torch.nn.GroupNorm(num_groups=min(memdim // 4, 32), num_channels=memdim, eps=1e-6)
         self.linA_cells = LinearOnChannel(self.memdim, self.dim_ff_cells)
         self.linB_cells = LinearOnChannel(self.dim_ff_cells, self.memdim)
         self.act = act
@@ -259,10 +281,10 @@ class SpecialTransformerLayer(torch.nn.Module):
         self.mhca2 = MHCrossAttn(dimA=self.memdim, dimB=self.dim, numheads=self.numheads, skip_rescale=skip_rescale,
                                 add_pos=add_pos, Asize=memsize, Bsize=imgsize)
 
-        self.step_linear = dense(self.step_emb_dim, self.memdim)
-        self.zemb_linear = None
+        self.step_linear_gn = torch.nn.Sequential(dense(self.step_emb_dim, self.adaptdim), self.act)
+        self.zemb_linear_gn = None
         if self.z_emb_dim != -1:
-            self.zemb_linear = dense(self.z_emb_dim, self.memdim)
+            self.zemb_linear_gn = torch.nn.Sequential(dense(self.z_emb_dim, self.adaptdim), self.act)
 
     def forward(self, x, cells, stepemb=None, zemb=None):
         """
@@ -275,13 +297,21 @@ class SpecialTransformerLayer(torch.nn.Module):
         cells = self.mhca(x, cells)
         # do self-attention on memory
         cells = self.mhsa(cells)
-        # add step embedding to memory
+
+        # compute adaptive state values
+        adaptive_h = None
         if stepemb is not None:
-            cells += self.step_linear(stepemb)[..., None, None]
+            _adaptive_h = self.step_linear_gn(stepemb)[..., None, None]
+            adaptive_h = adaptive_h + _adaptive_h if adaptive_h is not None else _adaptive_h
         if zemb is not None:
-            cells += self.zemb_linear(zemb)[..., None, None]
+            _adaptive_h = self.zemb_linear_gn(zemb)[..., None, None]
+            adaptive_h = adaptive_h + _adaptive_h if adaptive_h is not None else _adaptive_h
+
         # update memory
-        cells = self.groupnorm_cells(cells)
+        if adaptive_h is not None:
+            cells = self.groupnorm_cells(cells, adaptive_h)
+        else:
+            cells = self.groupnorm_cells(cells)
         _cells = self.linA_cells(cells)
         _cells = self.act(_cells)
         _cells = self.linB_cells(_cells)
@@ -294,7 +324,10 @@ class SpecialTransformerLayer(torch.nn.Module):
         x = self.mhca2(cells, x)
         skip_x = x
         # update image
-        x = self.groupnorm(x)
+        if adaptive_h is not None:
+            x = self.groupnorm(x, adaptive_h)
+        else:
+            x = self.groupnorm(x)
         _x = self.linA(x)
         _x = self.act(_x)
         _x = self.linB(_x)
@@ -332,11 +365,11 @@ class ResidualBlock(torch.nn.Module):
 
         self.dense_time = None
         if t_emb_dim != -1:
-            self.dense_time = dense(t_emb_dim, out_channels)
+            self.dense_time = torch.nn.Sequential(dense(t_emb_dim, z_emb_dim), act)
 
         self.act = act
         self.z_emb_dim = z_emb_dim
-        self.adaptive = self.z_emb_dim != -1
+        self.adaptive = self.z_emb_dim != -1 or t_emb_dim != -1
         if self.adaptive:
             self.groupnorm1 = AdaptiveGroupNorm(min(in_channels // 4, 32), in_channels, self.z_emb_dim)
             self.groupnorm2 = AdaptiveGroupNorm(min(out_channels // 4, 32), out_channels, self.z_emb_dim)
@@ -349,8 +382,17 @@ class ResidualBlock(torch.nn.Module):
             self.skip = LinearOnChannel(in_channels, out_channels, bias=False)
 
     def forward(self, input, t_emb=None, z_emb=None):
+
+        modulator = None
+        if t_emb is not None:
+            _modulator = self.dense_time(t_emb)
+            modulator = modulator + _modulator if modulator is not None else _modulator
         if z_emb is not None:
-            out = self.act(self.groupnorm1(input, z_emb))
+            _modulator = z_emb
+            modulator = modulator + _modulator if modulator is not None else _modulator
+
+        if modulator is not None:
+            out = self.act(self.groupnorm1(input, modulator))
         else:
             out = self.act(self.groupnorm1(input))
 
@@ -362,11 +404,9 @@ class ResidualBlock(torch.nn.Module):
             input = up_or_down_sampling.upsample_2d(input, self.fir_kernel, factor=2)
 
         out = self.conv1(out)
-        if t_emb is not None:
-            out += self.dense_time(t_emb)[..., None, None]
 
-        if z_emb is not None:
-            out = self.act(self.groupnorm2(out, z_emb))
+        if modulator is not None:
+            out = self.act(self.groupnorm2(out, modulator))
         else:
             out = self.act(self.groupnorm2(out))
 
@@ -420,8 +460,8 @@ class Discriminator_32x32(torch.nn.Module):
 
         self.act = act
         self.time_embed = TimestepEmbedding(step_emb_dim, act=act, maxsteps=self.maxsteps)
-        self.x_posembed = LearnedPositionalEmbeddings(self.imgsize, self.imgsize, self.num_features)
-        self.cell_posembed = LearnedPositionalEmbeddings(self.memsize, self.memsize, self.memdim)
+        self.x_posembed = LearnedPositionalEmbeddings2D(self.imgsize, self.imgsize, self.num_features)
+        self.cell_posembed = LearnedPositionalEmbeddings2DIndep(self.memsize, self.memsize, self.memdim)
 
         self.initmap = LinearOnChannel(self.num_inp_channels*2, self.num_features)  # 32x32
 
@@ -504,8 +544,8 @@ class Generator_32x32(torch.nn.Module):
 
         self.act = act
         self.time_embed = TimestepEmbedding(step_emb_dim, act=act, maxsteps=self.maxsteps)
-        self.x_posembed = LearnedPositionalEmbeddings(self.imgsize, self.imgsize, self.num_features)
-        self.cell_posembed = LearnedPositionalEmbeddings(self.memsize, self.memsize, self.memdim)
+        self.x_posembed = LearnedPositionalEmbeddings2D(self.imgsize, self.imgsize, self.num_features)
+        self.cell_posembed = LearnedPositionalEmbeddings2DIndep(self.memsize, self.memsize, self.memdim)
 
         self.initmap = LinearOnChannel(self.num_inp_channels, self.num_features)  # 32x32
 
