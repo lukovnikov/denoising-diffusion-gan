@@ -342,9 +342,9 @@ def train(rank, gpu, args, trainlocal=False):
         global_step, epoch, init_epoch = 0, 0, 0
 
     tt.tick()
-    afterburnersteps = args.afterburner_steps if args.afterburner_steps != -1 else [args.min_timesteps, args.max_timesteps]
+    extratrain_steps = args.extratrain_steps if args.extratrain_steps != -1 else [args.min_timesteps, args.max_timesteps]
     numt_sched = get_numt_schedule(args.max_timestep, args.min_timestep, numepochs=args.num_epoch+1,
-                                   afterburner_steps=afterburnersteps, afterburner_epochs=args.afterburner_epochs)
+                                   extratrain_steps=extratrain_steps, extratrain_epochs=args.extratrain_epochs)
     for epoch in range(init_epoch, args.num_epoch+1):
         num_t = numt_sched.pop(0) if len(numt_sched) > 0 else num_t
         if not trainlocal:
@@ -492,9 +492,9 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def get_numt_schedule(init=1000, end=4, numepochs=None, doubletime=5, afterburner_steps=None, afterburner_epochs=None):
+def get_numt_schedule(init=1000, end=4, numepochs=None, doubletime=5, extratrain_steps=None, extratrain_epochs=None):
 
-    numepochs = numepochs - len(afterburner_steps) * afterburner_epochs
+    numepochs = numepochs - len(extratrain_steps) * extratrain_epochs
 
     x = init
     schedule = [x]
@@ -512,8 +512,16 @@ def get_numt_schedule(init=1000, end=4, numepochs=None, doubletime=5, afterburne
             if len(schedule) > 1 and (numepochs - len(ret)) / (len(schedule) - 1) < ratio:
                 schedule.pop(0)
 
-        if afterburner_steps is not None:
-            pass # TODO
+        if extratrain_steps is not None:
+            _ret = []
+            extratrain_steps = set(extratrain_steps)
+            for rete in ret:
+                if rete in extratrain_steps:
+                    _ret += [rete] * extratrain_epochs
+                    extratrain_steps -= {rete,}
+                _ret.append(rete)
+            ret = _ret
+
         return ret
 
 #%%
@@ -521,8 +529,10 @@ def get_numt_schedule(init=1000, end=4, numepochs=None, doubletime=5, afterburne
 
 # CIFAR10:   python train_ddgan.py --dataset cifar10 --exp ddgan_cifar10_exp1 --batch_size 64 --num_epoch 1800 -n_mlp 4 --use_ema --r1_gamma 0.02 --lr_d 1.25e-4 --lr_g 1.6e-4 --lazy_reg 15 --ch_mult 1 2 2 2 --num_gpus_per_node 1 --which_gpu 0
 
+# CIFAR10 for improved:   python train_ddgan_improved.py --dataset cifar10 --exp ddgan_cifar10_exp1 --batch_size 64 --num_epoch 1800 -n_mlp 4 --use_ema --r1_gamma 0.02 --lr_d 2e-4 --lr_g 2e-4 --lazy_reg 15 --ch_mult 1 2 2 2 --num_gpus_per_node 1 --which_gpu 0
+
 if __name__ == '__main__':
-    get_numt_schedule(4, 4, 150)
+    get_numt_schedule(1000, 4, 150, extratrain_steps=[4, 1000], extratrain_epochs=10)
     parser = argparse.ArgumentParser('ddgan parameters')
     parser.add_argument('--seed', type=int, default=1024,
                         help='seed used for initialization')
@@ -593,9 +603,9 @@ if __name__ == '__main__':
     parser.add_argument('--t_emb_dim', type=int, default=256)
     parser.add_argument('--batch_size', type=int, default=128, help='input batch size')
     parser.add_argument('--num_epoch', type=int, default=1200)
-    parser.add_argument('--afterburner_epochs', type=int, default=10)
-    parser.add_argument('--afterburn_steps', nargs='+', type=int, default="-1",
-                            help='At which sizes to run afterburner epochs')
+    parser.add_argument('--extratrain_epochs', type=int, default=10)
+    parser.add_argument('--extratrain_steps', nargs='+', type=int, default="-1",
+                            help='At which sizes to run extra epochs')
 
     parser.add_argument('--ngf', type=int, default=64)
 
