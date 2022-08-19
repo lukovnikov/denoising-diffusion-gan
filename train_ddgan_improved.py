@@ -7,6 +7,8 @@
 
 
 import argparse
+import math
+
 import torch
 import numpy as np
 
@@ -59,16 +61,14 @@ def extract(input, t, shape):
 
     return out
 
-def get_time_schedule(args, device):
-    n_timestep = args.num_timesteps
+def get_time_schedule(n_timestep, device):
     eps_small = 1e-3
     t = np.arange(0, n_timestep + 1, dtype=np.float64)
     t = t / n_timestep
     t = torch.from_numpy(t) * (1. - eps_small)  + eps_small
     return t.to(device)
 
-def get_sigma_schedule(args, device):
-    n_timestep = args.num_timesteps
+def get_sigma_schedule(n_timestep, device):
     beta_min = args.beta_min
     beta_max = args.beta_max
     eps_small = 1e-3
@@ -92,9 +92,9 @@ def get_sigma_schedule(args, device):
     return sigmas, a_s, betas
 
 class Diffusion_Coefficients():
-    def __init__(self, args, device):
+    def __init__(self, num_t, device):
                 
-        self.sigmas, self.a_s, _ = get_sigma_schedule(args, device=device)
+        self.sigmas, self.a_s, _ = get_sigma_schedule(num_t, device=device)
         self.a_s_cum = np.cumprod(self.a_s.cpu())
         self.sigmas_cum = np.sqrt(1 - self.a_s_cum ** 2)
         self.a_s_prev = self.a_s.clone()
@@ -131,9 +131,9 @@ def q_sample_pairs(coeff, x_start, t):
     return x_t, x_t_plus_one
 #%% posterior sampling
 class Posterior_Coefficients():
-    def __init__(self, args, device):
+    def __init__(self, num_t, device):
         
-        _, _, self.betas = get_sigma_schedule(args, device=device)
+        _, _, self.betas = get_sigma_schedule(num_t, device=device)
         
         #we don't need the zeros
         self.betas = self.betas.type(torch.float32)[1:]
@@ -195,8 +195,8 @@ def sample_from_model(coefficients, generator, n_time, x_init, T, opt):
 
 #%%
 def train(rank, gpu, args, trainlocal=False):
-    from score_sde.models.discriminator import Discriminator_small, Discriminator_large
-    from score_sde.models.ncsnpp_generator_adagn import NCSNpp
+    from score_sde.models.discriminator_improved import Discriminator_small, Discriminator_large
+    from score_sde.models.ncsnpp_generator_adagn_improved import NCSNpp
     from EMA import EMA
 
     tt = ticktock("script")
@@ -320,11 +320,6 @@ def train(rank, gpu, args, trainlocal=False):
             copy_source(__file__, exp_path)
             shutil.copytree('score_sde/models', os.path.join(exp_path, 'score_sde/models'))
     
-    
-    coeff = Diffusion_Coefficients(args, device)
-    pos_coeff = Posterior_Coefficients(args, device)
-    T = get_time_schedule(args, device)
-    
     if args.resume:
         tt.msg("resuming")
         checkpoint_file = os.path.join(exp_path, 'content.pth')
@@ -347,12 +342,25 @@ def train(rank, gpu, args, trainlocal=False):
         global_step, epoch, init_epoch = 0, 0, 0
 
     tt.tick()
+    afterburnersteps = args.afterburner_steps if args.afterburner_steps != -1 else [args.min_timesteps, args.max_timesteps]
+    numt_sched = get_numt_schedule(args.max_timestep, args.min_timestep, numepochs=args.num_epoch+1,
+                                   afterburner_steps=afterburnersteps, afterburner_epochs=args.afterburner_epochs)
     for epoch in range(init_epoch, args.num_epoch+1):
+        num_t = numt_sched.pop(0) if len(numt_sched) > 0 else num_t
         if not trainlocal:
             train_sampler.set_epoch(epoch)
 
         # tt.msg(f"doing iterations: {len(data_loader)} batches, {subiters_discriminator} iters D / 1 iter G")
         tt.msg(f"doing iterations: {len(data_loader)} batches")
+
+        # set buffer in models
+        netD.max_t[0] = num_t
+        netG.max_t[0] = num_t
+        # compute coefficients
+        coeff = Diffusion_Coefficients(num_t, device)
+        pos_coeff = Posterior_Coefficients(num_t, device)
+        T = get_time_schedule(num_t, device)
+
         glosses = []
         dlosses = []
         for iteration, (x, y) in enumerate(data_loader):
@@ -364,9 +372,13 @@ def train(rank, gpu, args, trainlocal=False):
             #sample from p(x_0)
             real_data = x.to(device, non_blocking=True)
             #sample t
-            t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
+            t = torch.randint(0, num_t, (real_data.size(0),), device=device)
 
             x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
+            if args.different_xt:
+                x_tp1_star = q_sample(coeff, real_data, t+1)      # sample a dfferent x_t for fake training
+            else:
+                x_tp1_star = x_tp1
             x_t.requires_grad = True
 
             # train with real
@@ -392,10 +404,10 @@ def train(rank, gpu, args, trainlocal=False):
             # train with fake
             latent_z = torch.randn(batch_size, nz, device=device)
 
-            x_0_predict = netG(x_tp1.detach(), t, latent_z)
-            x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
+            x_0_predict = netG(x_tp1_star.detach(), t, latent_z)
+            x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1_star, t)
 
-            output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
+            output = netD(x_pos_sample, t, x_tp1_star.detach()).view(-1)
             errD_fake = F.softplus(output)
             errD_fake = errD_fake.mean()
             errD_fake.backward()
@@ -410,7 +422,7 @@ def train(rank, gpu, args, trainlocal=False):
                 p.requires_grad = False
             netG.zero_grad()
 
-            t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
+            t = torch.randint(0, num_t, (real_data.size(0),), device=device)
             x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
             latent_z = torch.randn(batch_size, nz,device=device)
             x_0_predict = netG(x_tp1.detach(), t, latent_z)
@@ -443,7 +455,7 @@ def train(rank, gpu, args, trainlocal=False):
                 torchvision.utils.save_image(x_pos_sample, os.path.join(exp_path, 'xpos_epoch_{}.png'.format(epoch)), normalize=True)
             
             x_t_1 = torch.randn_like(real_data)
-            fake_sample = sample_from_model(pos_coeff, netG, args.num_timesteps, x_t_1, T, args)
+            fake_sample = sample_from_model(pos_coeff, netG, num_t, x_t_1, T, args)
             torchvision.utils.save_image(fake_sample, os.path.join(exp_path, 'sample_discrete_epoch_{}.png'.format(epoch)), normalize=True)
             
             if args.save_content:
@@ -477,13 +489,40 @@ def init_processes(rank, size, fn, args):
     cleanup()  
 
 def cleanup():
-    dist.destroy_process_group()    
+    dist.destroy_process_group()
+
+
+def get_numt_schedule(init=1000, end=4, numepochs=None, doubletime=5, afterburner_steps=None, afterburner_epochs=None):
+
+    numepochs = numepochs - len(afterburner_steps) * afterburner_epochs
+
+    x = init
+    schedule = [x]
+    while x > end:
+        x = x/math.pow(2, 1/doubletime)
+        schedule.append(round(x))
+
+    if numepochs is None:
+        return schedule
+    else:
+        ratio = numepochs / len(schedule)
+        ret = []
+        while len(ret) < numepochs:
+            ret.append(schedule[0])
+            if len(schedule) > 1 and (numepochs - len(ret)) / (len(schedule) - 1) < ratio:
+                schedule.pop(0)
+
+        if afterburner_steps is not None:
+            pass # TODO
+        return ret
+
 #%%
 
 
 # CIFAR10:   python train_ddgan.py --dataset cifar10 --exp ddgan_cifar10_exp1 --batch_size 64 --num_epoch 1800 -n_mlp 4 --use_ema --r1_gamma 0.02 --lr_d 1.25e-4 --lr_g 1.6e-4 --lazy_reg 15 --ch_mult 1 2 2 2 --num_gpus_per_node 1 --which_gpu 0
 
 if __name__ == '__main__':
+    get_numt_schedule(4, 4, 150)
     parser = argparse.ArgumentParser('ddgan parameters')
     parser.add_argument('--seed', type=int, default=1024,
                         help='seed used for initialization')
@@ -507,7 +546,7 @@ if __name__ == '__main__':
                             help='number of initial channels in denosing model')
     parser.add_argument('--n_mlp', type=int, default=3,
                             help='number of mlp layers for z')
-    parser.add_argument('--ch_mult', nargs='+', type=int,
+    parser.add_argument('--ch_mult', nargs='+', type=int, default="-1",
                             help='channel multiplier')
     parser.add_argument('--num_res_blocks', type=int, default=2,
                             help='number of resnet blocks per scale')
@@ -544,12 +583,20 @@ if __name__ == '__main__':
     parser.add_argument('--exp', default='experiment_cifar_default', help='name of experiment')
     parser.add_argument('--dataset', default='cifar10', help='name of dataset')
     parser.add_argument('--nz', type=int, default=100)
-    parser.add_argument('--num_timesteps', type=int, default=4)
+    parser.add_argument('--min_timesteps', type=int, default=4)
+    parser.add_argument('--max_timesteps', type=int, default=1000)
+
+    parser.add_argument('--different_xt', action='store_true', default=False)
+    parser.add_argument('--expbias_correct', action='store_true', default=False)
 
     parser.add_argument('--z_emb_dim', type=int, default=256)
     parser.add_argument('--t_emb_dim', type=int, default=256)
     parser.add_argument('--batch_size', type=int, default=128, help='input batch size')
     parser.add_argument('--num_epoch', type=int, default=1200)
+    parser.add_argument('--afterburner_epochs', type=int, default=10)
+    parser.add_argument('--afterburn_steps', nargs='+', type=int, default="-1",
+                            help='At which sizes to run afterburner epochs')
+
     parser.add_argument('--ngf', type=int, default=64)
 
     parser.add_argument('--lr_g', type=float, default=1.5e-4, help='learning rate g')

@@ -423,8 +423,8 @@ class ResidualBlock(torch.nn.Module):
         return out
 
 
-class TimestepEmbedding(torch.nn.Module):
-    def __init__(self, outdim, act=torch.nn.GELU(), maxsteps=-1):
+class ContinuousTimestepEmbedding(torch.nn.Module):
+    def __init__(self, outdim, embdim=1000, act=torch.nn.GELU(), maxsteps=-1):
         """
         :param hdim:
         :param outdim:
@@ -433,7 +433,7 @@ class TimestepEmbedding(torch.nn.Module):
         """
         super().__init__()
         self.embdim, self.hdim, self.outdim, self.maxsteps \
-            = 1000, outdim, outdim, maxsteps
+            = embdim, outdim, outdim, maxsteps
         self.net = torch.nn.Sequential(
             dense(1, self.embdim),
             act,
@@ -459,7 +459,7 @@ class Discriminator_32x32(torch.nn.Module):
             = num_inp_channels, imgsize, num_features, step_emb_dim, memsize, memdim, num_heads, maxsteps
 
         self.act = act
-        self.time_embed = TimestepEmbedding(step_emb_dim, act=act, maxsteps=self.maxsteps)
+        self.time_embed = ContinuousTimestepEmbedding(step_emb_dim, act=act, maxsteps=self.maxsteps)
         self.x_posembed = LearnedPositionalEmbeddings2D(self.imgsize, self.imgsize, self.num_features)
         self.cell_posembed = LearnedPositionalEmbeddings2DIndep(self.memsize, self.memsize, self.memdim)
 
@@ -543,7 +543,7 @@ class Generator_32x32(torch.nn.Module):
             = num_inp_channels, imgsize, num_features, step_emb_dim, memsize, memdim, num_heads, maxsteps, z_emb_dim, zdim, num_z_map_layers
 
         self.act = act
-        self.time_embed = TimestepEmbedding(step_emb_dim, act=act, maxsteps=self.maxsteps)
+        self.time_embed = ContinuousTimestepEmbedding(step_emb_dim, act=act, maxsteps=self.maxsteps)
         self.x_posembed = LearnedPositionalEmbeddings2D(self.imgsize, self.imgsize, self.num_features)
         self.cell_posembed = LearnedPositionalEmbeddings2DIndep(self.memsize, self.memsize, self.memdim)
 
