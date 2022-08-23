@@ -34,6 +34,8 @@ import shutil
 
 from util import ticktock
 
+DEBUG = False
+
 
 def copy_source(file, output_dir):
     shutil.copyfile(file, os.path.join(output_dir, os.path.basename(file)))
@@ -110,9 +112,10 @@ def q_sample(coeff, x_start, t, *, noise=None):
     """
     if noise is None:
       noise = torch.randn_like(x_start)
-      
-    x_t = extract(coeff.a_s_cum, t, x_start.shape) * x_start + \
-          extract(coeff.sigmas_cum, t, x_start.shape) * noise
+
+    a_s_cum = extract(coeff.a_s_cum, t, x_start.shape)
+    sigmas_cum = extract(coeff.sigmas_cum, t, x_start.shape)
+    x_t = a_s_cum * x_start + sigmas_cum * noise
     
     return x_t
 
@@ -276,19 +279,19 @@ def train(rank, gpu, args, trainlocal=False):
                                                   drop_last=True)
     
     netG = NCSNpp(args).to(device)
-    tt.msg(f"#param generator: {count_parameters(netG)}")
+    tt.msg(f"#param generator: {count_parameters(netG)/1e6:.3f} M")
     
-
+    discriminator_input_num_channels = 2 * args.num_channels if not args.do_decoupled else args.num_channels
     if args.dataset == 'cifar10' or args.dataset == 'stackmnist' or args.image_size < 128:
-        netD = Discriminator_small(nc = 2*args.num_channels, ngf = args.ngf,
+        netD = Discriminator_small(nc = discriminator_input_num_channels, ngf = args.ngf,
                                t_emb_dim = args.t_emb_dim,
                                act=nn.LeakyReLU(0.2)).to(device)
     else:
-        netD = Discriminator_large(nc = 2*args.num_channels, ngf = args.ngf, 
+        netD = Discriminator_large(nc = discriminator_input_num_channels, ngf = args.ngf,
                                    t_emb_dim = args.t_emb_dim,
                                    act=nn.LeakyReLU(0.2)).to(device)
 
-    tt.msg(f"#param discriminator: {count_parameters(netD)}")
+    tt.msg(f"#param discriminator: {count_parameters(netD)/1e6:.3f} M")
 
     if not trainlocal:
         broadcast_params(netG.parameters())
@@ -303,6 +306,8 @@ def train(rank, gpu, args, trainlocal=False):
     
     schedulerG = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerG, args.num_epoch, eta_min=1e-5)
     schedulerD = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerD, args.num_epoch, eta_min=1e-5)
+    # schedulerG = torch.optim.lr_scheduler.ConstantLR(optimizerG, factor=1., total_iters=args.num_epoch)
+    # schedulerD = torch.optim.lr_scheduler.ConstantLR(optimizerD, factor=1., total_iters=args.num_epoch)
 
     #ddp
     if not trainlocal:
@@ -343,10 +348,16 @@ def train(rank, gpu, args, trainlocal=False):
 
     tt.tick()
     extratrain_steps = args.extratrain_steps if args.extratrain_steps != -1 else [args.min_timesteps, args.max_timesteps]
-    numt_sched = get_numt_schedule(args.max_timestep, args.min_timestep, numepochs=args.num_epoch+1,
+    numt_sched = get_numt_schedule(args.max_timesteps, args.min_timesteps, numsteps=args.num_epoch-args.num_pretrain_epoch,
                                    extratrain_steps=extratrain_steps, extratrain_epochs=args.extratrain_epochs)
+    numt_sched = [args.max_timesteps] * args.num_pretrain_epoch + numt_sched
+
+    PRETRAIN_NOISE_SCALE = 1e-2
+    prev_num_t = 0
+    prev_stage = None
+
     for epoch in range(init_epoch, args.num_epoch+1):
-        num_t = numt_sched.pop(0) if len(numt_sched) > 0 else num_t
+        num_t = numt_sched[epoch] if len(numt_sched) > 0 else num_t
         if not trainlocal:
             train_sampler.set_epoch(epoch)
 
@@ -356,86 +367,164 @@ def train(rank, gpu, args, trainlocal=False):
         # set buffer in models
         netD.max_t[0] = num_t
         netG.max_t[0] = num_t
-        # compute coefficients
-        coeff = Diffusion_Coefficients(num_t, device)
-        pos_coeff = Posterior_Coefficients(num_t, device)
-        T = get_time_schedule(num_t, device)
+
+        if num_t != prev_num_t:
+            tt.msg(f"number of timesteps changed: {num_t}. Recomputing diffusion coefficients.")
+            # compute coefficients
+            coeff = Diffusion_Coefficients(num_t, device)
+            pos_coeff = Posterior_Coefficients(num_t, device)
+            T = get_time_schedule(num_t, device)
+            prev_num_t = num_t
 
         glosses = []
         dlosses = []
         for iteration, (x, y) in enumerate(data_loader):
-            for p in netD.parameters():  
-                p.requires_grad = True  
 
-            # for subiter in range(subiters_discriminator):
-            netD.zero_grad()
-            #sample from p(x_0)
+            # INIT
+            # sample from p(x_0)
             real_data = x.to(device, non_blocking=True)
-            #sample t
+            # sample t
             t = torch.randint(0, num_t, (real_data.size(0),), device=device)
 
             x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
-            if args.different_xt:
-                x_tp1_star = q_sample(coeff, real_data, t+1)      # sample a dfferent x_t for fake training
+            if args.use_xtstar:
+                x_tp1_star = q_sample(coeff, real_data, t + 1)  # sample a dfferent x_t for fake training
             else:
                 x_tp1_star = x_tp1
             x_t.requires_grad = True
+            x_pos_sample = None
 
-            # train with real
-            D_real = netD(x_t, t, x_tp1.detach()).view(-1)
-            errD_real = F.softplus(-D_real)
-            errD_real = errD_real.mean()
-            errD_real.backward(retain_graph=True)
 
-            if args.lazy_reg is None:
-                grad_real = torch.autograd.grad(outputs=D_real.sum(), inputs=x_t, create_graph=True)[0]
-                grad_penalty = (grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2).mean()
 
-                grad_penalty = args.r1_gamma / 2 * grad_penalty
-                grad_penalty.backward()
+            if epoch < args.num_pretrain_epoch:
+                stage = "pretrain"
+                if prev_stage != stage:
+                    tt.msg(f"Training stage: {stage}")
+                    prev_stage = stage
+
+                # # region PRETRAIN DISCRIMINATOR to distinguish real from other levels of noise
+                # x_pos_sample = x_t + torch.randn_like(x_t) * PRETRAIN_NOISE_SCALE
+                # if args.do_decoupled:
+                #     output = netD(x_pos_sample, t).view(-1)
+                # else:
+                #     output = netD(x_pos_sample, t, x_tp1_star.detach()).view(-1)
+                #
+                # errD_fake = F.softplus(output)
+                # errD_fake = errD_fake.mean()
+                # errD_fake.backward()
+                #
+                # errD = errD_real + errD_fake
+                # dlosses.append(errD.item())
+                #
+                # optimizerD.step()
+                # # endregion
+
+                # region PRETRAIN GENERATOR to do denoising like DDPM
+                netG.zero_grad()
+
+                t = torch.randint(0, num_t, (real_data.size(0),), device=device)
+                _, x_tp1 = q_sample_pairs(coeff, real_data, t)
+
+                if args.do_decoupled:
+                    x_0_predict = netG(x_tp1.detach(), t)
+                else:
+                    latent_z = torch.randn(batch_size, nz, device=device)
+                    x_0_predict = netG(x_tp1.detach(), t, latent_z)
+
+                # compute L2 reconstruction loss
+                errG = torch.nn.functional.mse_loss(x_0_predict, real_data)
+                errG = errG.mean()
+
+                errG.backward()
+                optimizerG.step()
+
+                glosses.append(errG.item())
+                # endregion
+
             else:
-                if global_step % args.lazy_reg == 0:
+                stage = "train"
+                if prev_stage != stage:
+                    tt.msg(f"Training stage: {stage}")
+                    prev_stage = stage
+
+                # region (PRE)TRAIN DISCRIMINATOR WITH REAL
+                for p in netD.parameters():
+                    p.requires_grad = True
+                netD.zero_grad()
+
+                if args.do_decoupled:
+                    D_real = netD(x_t, t).view(-1)
+                else:
+                    D_real = netD(x_t, t, x_tp1.detach()).view(-1)
+
+                errD_real = F.softplus(-D_real)
+                errD_real = errD_real.mean()
+                errD_real.backward(retain_graph=True)
+
+                if args.lazy_reg is None:
                     grad_real = torch.autograd.grad(outputs=D_real.sum(), inputs=x_t, create_graph=True)[0]
                     grad_penalty = (grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2).mean()
 
                     grad_penalty = args.r1_gamma / 2 * grad_penalty
                     grad_penalty.backward()
+                else:
+                    if global_step % args.lazy_reg == 0:
+                        grad_real = torch.autograd.grad(outputs=D_real.sum(), inputs=x_t, create_graph=True)[0]
+                        grad_penalty = (grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2).mean()
 
-            # train with fake
-            latent_z = torch.randn(batch_size, nz, device=device)
+                        grad_penalty = args.r1_gamma / 2 * grad_penalty
+                        grad_penalty.backward()
+                # endregion
 
-            x_0_predict = netG(x_tp1_star.detach(), t, latent_z)
-            x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1_star, t)
+                # region TRAIN DISCRIMINATOR WITH FAKE
+                if args.do_decoupled:
+                    x_0_predict = netG(x_tp1_star.detach(), t)
+                    x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1_star, t)
 
-            output = netD(x_pos_sample, t, x_tp1_star.detach()).view(-1)
-            errD_fake = F.softplus(output)
-            errD_fake = errD_fake.mean()
-            errD_fake.backward()
+                    output = netD(x_pos_sample, t).view(-1)
+                else:
+                    latent_z = torch.randn(batch_size, nz, device=device)
+                    x_0_predict = netG(x_tp1_star.detach(), t, latent_z)
+                    x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1_star, t)
 
-            errD = errD_real + errD_fake
-            dlosses.append(errD.item())
-            # Update D
-            optimizerD.step()
+                    output = netD(x_pos_sample, t, x_tp1_star.detach()).view(-1)
 
-            #update G
-            for p in netD.parameters():
-                p.requires_grad = False
-            netG.zero_grad()
+                errD_fake = F.softplus(output)
+                errD_fake = errD_fake.mean()
+                errD_fake.backward()
 
-            t = torch.randint(0, num_t, (real_data.size(0),), device=device)
-            x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
-            latent_z = torch.randn(batch_size, nz,device=device)
-            x_0_predict = netG(x_tp1.detach(), t, latent_z)
-            x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
+                errD = errD_real + errD_fake
+                dlosses.append(errD.item())
 
-            output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
-            errG = F.softplus(-output)
-            errG = errG.mean()
+                optimizerD.step()
+                # endregion
 
-            errG.backward()
-            optimizerG.step()
+                # region TRAIN GENERATOR using discriminator
+                for p in netD.parameters():
+                    p.requires_grad = False
+                netG.zero_grad()
 
-            glosses.append(errG.item())
+                t = torch.randint(0, num_t, (real_data.size(0),), device=device)
+                x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
+
+                if args.do_decoupled:
+                    x_0_predict = netG(x_tp1.detach(), t)
+                    x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
+                    output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
+                else:
+                    latent_z = torch.randn(batch_size, nz,device=device)
+                    x_0_predict = netG(x_tp1.detach(), t, latent_z)
+                    x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
+                    output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
+
+                errG = F.softplus(-output)
+                errG = errG.mean()
+
+                errG.backward()
+                optimizerG.step()
+
+                glosses.append(errG.item())
+                # endregion
 
             global_step += 1
             if iteration % 100 == 0:
@@ -444,6 +533,9 @@ def train(rank, gpu, args, trainlocal=False):
                     avgDloss = np.mean(dlosses) if len(dlosses) > 0 else 0
                     tt.tock(f'Ep. {epoch} iter: {iteration}, G Loss: {avgGloss:.5f}, D Loss: {avgDloss:.5f}')
                     tt.tick()
+
+            # DEBUG BREAK:
+            if DEBUG: break       # comment out for running
         
         if not args.no_lr_decay:
             
@@ -451,7 +543,7 @@ def train(rank, gpu, args, trainlocal=False):
             schedulerD.step()
         
         if rank == 0:
-            if epoch % 10 == 0:
+            if epoch % 10 == 0 and x_pos_sample is not None:
                 torchvision.utils.save_image(x_pos_sample, os.path.join(exp_path, 'xpos_epoch_{}.png'.format(epoch)), normalize=True)
             
             x_t_1 = torch.randn_like(real_data)
@@ -473,7 +565,7 @@ def train(rank, gpu, args, trainlocal=False):
                     optimizerG.swap_parameters_with_ema(store_params_in_ema=True)
                     
                 torch.save(netG.state_dict(), os.path.join(exp_path, 'netG_{}.pth'.format(epoch)))
-                if args.use_ema:
+                if args.use_ema:        # double-swap is how it should be !
                     optimizerG.swap_parameters_with_ema(store_params_in_ema=True)
 
 
@@ -492,47 +584,42 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def get_numt_schedule(init=1000, end=4, numepochs=None, doubletime=5, extratrain_steps=None, extratrain_epochs=None):
+def get_numt_schedule(init=1000, end=4, numsteps=100, extratrain_steps=None, extratrain_epochs=None):
 
-    numepochs = numepochs - len(extratrain_steps) * extratrain_epochs
+    numsteps = numsteps - len(extratrain_steps) * extratrain_epochs if extratrain_steps is not None else numsteps
 
     x = init
     schedule = [x]
+    numdouble = math.log(init / end, 2)
+    doubletime = numsteps / numdouble
     while x > end:
         x = x/math.pow(2, 1/doubletime)
         schedule.append(round(x))
 
-    if numepochs is None:
-        return schedule
-    else:
-        ratio = numepochs / len(schedule)
-        ret = []
-        while len(ret) < numepochs:
-            ret.append(schedule[0])
-            if len(schedule) > 1 and (numepochs - len(ret)) / (len(schedule) - 1) < ratio:
-                schedule.pop(0)
-
-        if extratrain_steps is not None:
-            _ret = []
-            extratrain_steps = set(extratrain_steps)
-            for rete in ret:
-                if rete in extratrain_steps:
-                    _ret += [rete] * extratrain_epochs
-                    extratrain_steps -= {rete,}
-                _ret.append(rete)
+    if extratrain_steps is not None:
+        _ret = []
+        extratrain_steps = set(extratrain_steps)
+        for rete in schedule:
+            if rete in extratrain_steps:
+                _ret += [rete] * extratrain_epochs
+                extratrain_steps -= {rete,}
+            _ret.append(rete)
             ret = _ret
 
-        return ret
+        return _ret
+    else:
+        return schedule
 
 #%%
 
 
-# CIFAR10:   python train_ddgan.py --dataset cifar10 --exp ddgan_cifar10_exp1 --batch_size 64 --num_epoch 1800 -n_mlp 4 --use_ema --r1_gamma 0.02 --lr_d 1.25e-4 --lr_g 1.6e-4 --lazy_reg 15 --ch_mult 1 2 2 2 --num_gpus_per_node 1 --which_gpu 0
+# CIFAR10:   python train_ddgan.py --dataset cifar10 --exp ddgan_cifar10_exp1 --batch_size 64 --num_epoch 1800 --n_mlp 4 --use_ema --r1_gamma 0.02 --lr_d 1.25e-4 --lr_g 1.6e-4 --lazy_reg 15 --ch_mult 1 2 2 2 --num_gpus_per_node 1 --which_gpu 0
 
-# CIFAR10 for improved:   python train_ddgan_improved.py --dataset cifar10 --exp ddgan_cifar10_exp1 --batch_size 64 --num_epoch 1800 -n_mlp 4 --use_ema --r1_gamma 0.02 --lr_d 2e-4 --lr_g 2e-4 --lazy_reg 15 --ch_mult 1 2 2 2 --num_gpus_per_node 1 --which_gpu 0
+# CIFAR10 for improved:   python train_ddgan_improved.py --dataset cifar10 --exp ddgan_cifar10_exp1 --batch_size 64 --num_epoch 1000 --n_mlp 4 --use_ema --r1_gamma 0.02 --lr_d 2e-4 --lr_g 2e-4 --lazy_reg 15 --ch_mult 1 2 2 2 --num_gpus_per_node 1 --which_gpu 0
 
 if __name__ == '__main__':
-    get_numt_schedule(1000, 4, 150, extratrain_steps=[4, 1000], extratrain_epochs=10)
+    # get_numt_schedule(1000, 4, 150, extratrain_steps=[4, 1000], extratrain_epochs=10)
+    get_numt_schedule(200, 4, 150, extratrain_steps=[4, 200], extratrain_epochs=10)
     parser = argparse.ArgumentParser('ddgan parameters')
     parser.add_argument('--seed', type=int, default=1024,
                         help='seed used for initialization')
@@ -552,7 +639,7 @@ if __name__ == '__main__':
                             help='beta_max for diffusion')
     
     
-    parser.add_argument('--num_channels_dae', type=int, default=128,
+    parser.add_argument('--num_channels_dae', type=int, default=64,     # was 128
                             help='number of initial channels in denosing model')
     parser.add_argument('--n_mlp', type=int, default=3,
                             help='number of mlp layers for z')
@@ -592,22 +679,24 @@ if __name__ == '__main__':
     #geenrator and training
     parser.add_argument('--exp', default='experiment_cifar_default', help='name of experiment')
     parser.add_argument('--dataset', default='cifar10', help='name of dataset')
-    parser.add_argument('--nz', type=int, default=100)
+    parser.add_argument('--nz', type=int, default=50)       # was 100
     parser.add_argument('--min_timesteps', type=int, default=4)
-    parser.add_argument('--max_timesteps', type=int, default=1000)
+    parser.add_argument('--max_timesteps', type=int, default=250)
 
-    parser.add_argument('--different_xt', action='store_true', default=False)
+    parser.add_argument('--use_xtstar', action='store_true', default=False)
+    parser.add_argument('--do_decoupled', action='store_true', default=False)
     parser.add_argument('--expbias_correct', action='store_true', default=False)
 
-    parser.add_argument('--z_emb_dim', type=int, default=256)
-    parser.add_argument('--t_emb_dim', type=int, default=256)
+    parser.add_argument('--z_emb_dim', type=int, default=64)        # was 256
+    parser.add_argument('--t_emb_dim', type=int, default=64)       # was 256
     parser.add_argument('--batch_size', type=int, default=128, help='input batch size')
-    parser.add_argument('--num_epoch', type=int, default=1200)
-    parser.add_argument('--extratrain_epochs', type=int, default=10)
+    parser.add_argument('--num_epoch', type=int, default=1000)
+    parser.add_argument('--num_pretrain_epoch', type=int, default=10)
+    parser.add_argument('--extratrain_epochs', type=int, default=20)
     parser.add_argument('--extratrain_steps', nargs='+', type=int, default="-1",
                             help='At which sizes to run extra epochs')
 
-    parser.add_argument('--ngf', type=int, default=64)
+    parser.add_argument('--ngf', type=int, default=64)      # was 64
 
     parser.add_argument('--lr_g', type=float, default=1.5e-4, help='learning rate g')
     parser.add_argument('--lr_d', type=float, default=1e-4, help='learning rate d')

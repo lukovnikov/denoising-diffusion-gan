@@ -31,7 +31,7 @@
 ''' Codes adapted from https://github.com/yang-song/score_sde_pytorch/blob/main/models/ncsnpp.py
 '''
 
-from . import utils, layers, layerspp_improved as layerspp, dense_layer
+from . import utils, layers_improved as layers, layerspp_improved as layerspp, dense_layer
 import torch.nn as nn
 import functools
 import torch
@@ -113,7 +113,7 @@ class NCSNpp(nn.Module):
       self.cond_map.append(nn.Linear(embed_dim, nf * 4))
       self.cond_map[-1].weight.data = default_initializer()(self.cond_map[-1].weight.shape)
       nn.init.zeros_(self.cond_map[-1].bias)
-      self.cond_map.append(torch.nn.GELU())
+      self.cond_map.append(self.act)
       self.cond_map.append(nn.Linear(nf * 4, nf * 4))
       self.cond_map[-1].weight.data = default_initializer()(self.cond_map[-1].weight.shape)
       nn.init.zeros_(self.cond_map[-1].bias)
@@ -283,9 +283,13 @@ class NCSNpp(nn.Module):
     self.register_buffer("max_t", torch.tensor([1000]))
     
 
-  def forward(self, x, time_cond, z):
+  def forward(self, x, time_cond, z=None):
     # timestep/noise_level embedding; only for continuous training
+    if z is None:
+      z = torch.zeros(x.size(0), self.config.nz, device=x.device, dtype=torch.float)
+
     zemb = self.z_transform(z)
+
     modules = self.all_modules
     m_idx = 0
     if self.embedding_type == 'fourier':
@@ -298,7 +302,7 @@ class NCSNpp(nn.Module):
       # Sinusoidal positional embeddings.
       timesteps = time_cond
      
-      temb = layers.get_timestep_embedding(timesteps/self.max_t.cpu().item(), self.nf)
+      temb = layers.get_timestep_embedding_cont(timesteps/self.max_t.cpu().item(), self.nf)
 
     else:
       raise ValueError(f'embedding type {self.embedding_type} unknown.')

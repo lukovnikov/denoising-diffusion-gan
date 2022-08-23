@@ -14,7 +14,7 @@ from . import layers_improved as layers
 
 dense = dense_layer.dense
 conv2d = dense_layer.conv2d
-get_sinusoidal_positional_embedding = layers.get_timestep_embedding
+get_sinusoidal_positional_embedding = layers.get_timestep_embedding_cont
 
 class TimestepEmbedding(nn.Module):
     def __init__(self, embedding_dim, hidden_dim, output_dim, act=nn.LeakyReLU(0.2)):
@@ -135,14 +135,15 @@ class Discriminator_small(nn.Module):
     self.register_buffer("max_t", torch.tensor([1000]))
     
         
-  def forward(self, x, t, x_t):
+  def forward(self, x, t, x_t=None):
     t_embed = self.act(self.t_embed(t/self.max_t.cpu().item()))
 
     if self.x2_step is not None:
         t_embed += self.steptime_emb.weight[0, :] if self.x2_step is False else self.steptime_emb.weight[1, :]
     
-  
-    input_x = torch.cat((x, x_t), dim = 1)
+    input_x = x
+    if x_t is not None:
+        input_x = torch.cat((x, x_t), dim = 1)
     
     h0 = self.start_conv(input_x)
     h1 = self.conv1(h0,t_embed)    
@@ -214,13 +215,15 @@ class Discriminator_large(nn.Module):
     self.register_buffer("max_t", torch.tensor([1000]))
     
         
-  def forward(self, x, t, x_t):
+  def forward(self, x, t, x_t=None):
     t_embed = self.act(self.t_embed(t/self.max_t.cpu().item()))
 
     if self.x2_step is not None:
         t_embed += self.steptime_emb.weight[0, :] if self.x2_step is False else self.steptime_emb.weight[1, :]
-    
-    input_x = torch.cat((x, x_t), dim = 1)
+
+    input_x = x
+    if x_t is not None:
+        input_x = torch.cat((x, x_t), dim = 1)
     
     h = self.start_conv(input_x)
     h = self.conv1(h,t_embed)    

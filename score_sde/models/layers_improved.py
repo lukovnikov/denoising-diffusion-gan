@@ -496,6 +496,37 @@ def get_timestep_embedding(timesteps, embedding_dim, max_positions=10000):
   return emb
 
 
+def get_timestep_embedding_cont(timesteps, embedding_dim):
+  """
+
+  :param timesteps:      must be between 0 and 1
+  :param embedding_dim:  dimension of embedding
+  :return:
+  """
+  max_positions = 10000
+  assert len(timesteps.shape) == 1  # and timesteps.dtype == tf.int32
+  half_dim = embedding_dim // 2
+  # magic number 10000 is from transformers
+  emb = math.log(max_positions) / (half_dim - 1)
+  emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb)
+  timesteps = timesteps * max_positions
+  emb = timesteps.float()[:, None] * emb[None, :]
+  emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+  if embedding_dim % 2 == 1:  # zero pad
+    emb = F.pad(emb, (0, 1), mode='constant')
+  assert emb.shape == (timesteps.shape[0], embedding_dim)
+  return emb
+
+
+def tst_timestep_embeddings():
+  x, _ = torch.sort(torch.rand(30))
+  print(x)
+  temb1 = get_timestep_embedding(x, 64).cpu().numpy()
+  print(temb1)
+  temb2 = get_timestep_embedding_cont(x, 64).cpu().numpy()
+  print(temb2)
+
+
 def _einsum(a, b, c, x, y):
   einsum_str = '{},{}->{}'.format(''.join(a), ''.join(b), ''.join(c))
   return torch.einsum(einsum_str, x, y)
@@ -630,6 +661,7 @@ class ResnetBlockDDPM(nn.Module):
 
 
 if __name__ == '__main__':
+    tst_timestep_embeddings()
     temb1 = get_timestep_embedding(torch.arange(0, 10) / 10, 10).cpu().numpy()
     print(temb1)
     temb2 = get_timestep_embedding(torch.arange(0, 20) / 20, 10).cpu().numpy()
