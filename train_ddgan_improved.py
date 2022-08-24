@@ -207,7 +207,8 @@ def train(rank, gpu, args, trainlocal=False):
     torch.manual_seed(args.seed + rank)
     torch.cuda.manual_seed(args.seed + rank)
     torch.cuda.manual_seed_all(args.seed + rank)
-    device = torch.device('cuda:{}'.format(gpu))
+    torch.cuda.set_device(gpu)
+    device = torch.device(f"cuda:{gpu}")
     
     batch_size = args.batch_size
     
@@ -615,9 +616,10 @@ def get_numt_schedule(init=1000, end=4, numsteps=100, extratrain_steps=None, ext
 
 # CIFAR10:   python train_ddgan.py --dataset cifar10 --exp ddgan_cifar10_exp1 --batch_size 64 --num_epoch 1800 --n_mlp 4 --use_ema --r1_gamma 0.02 --lr_d 1.25e-4 --lr_g 1.6e-4 --lazy_reg 15 --ch_mult 1 2 2 2 --num_gpus_per_node 1 --which_gpu 0
 
-# CIFAR10 for improved:   python train_ddgan_improved.py --dataset cifar10 --exp ddgan_cifar10_exp1 --batch_size 64 --num_epoch 1000 --n_mlp 4 --use_ema --r1_gamma 0.02 --lr_d 2e-4 --lr_g 2e-4 --lazy_reg 15 --ch_mult 1 2 2 2 --num_gpus_per_node 1 --which_gpu 0
+# CIFAR10 for improved:   python train_ddgan_improved.py --dataset cifar10 --exp ddgan_cifar10_exp1 --batch_size 128 --num_epoch 1000 --n_mlp 4 --use_ema --r1_gamma 0.02 --lr_d 2e-4 --lr_g 2e-4 --lazy_reg 15 --ch_mult 1 2 2 2 --num_gpus_per_node 1 --which_gpu 0
 
 if __name__ == '__main__':
+    # torch.backends.cudnn.enabled = False
     # get_numt_schedule(1000, 4, 150, extratrain_steps=[4, 1000], extratrain_epochs=10)
     get_numt_schedule(200, 4, 150, extratrain_steps=[4, 200], extratrain_epochs=10)
     parser = argparse.ArgumentParser('ddgan parameters')
