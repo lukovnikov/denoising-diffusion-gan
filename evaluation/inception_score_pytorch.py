@@ -17,7 +17,7 @@ import torchvision.transforms as transforms
 import numpy as np
 from scipy.stats import entropy
 
-from evaluation.fid_score import ImagePathDataset
+from scripts.evaluation.fid_score import ImagePathDataset
 
 IMAGE_EXTENSIONS = {'bmp', 'jpg', 'jpeg', 'pgm', 'png', 'ppm',
                     'tif', 'tiff', 'webp'}

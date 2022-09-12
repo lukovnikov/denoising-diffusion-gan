@@ -271,7 +271,7 @@ def calculate_fid_given_paths(paths, batch_size, device, dims, resize=0):
 
     block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
 
-    model = InceptionV3([block_idx]).to(device)
+    model = InceptionV3([block_idx], use_fid_inception=True, normalize_input=True).to(device)   # additional kwargs are set here as in default but are here to confirm
 
     m1, s1 = compute_statistics_of_path(paths[0], model, batch_size,
                                         dims, device, resize)
